@@ -1,0 +1,89 @@
+[tool.poetry]
+name = "keyleak-detector"
+version = "0.7.0"
+description = "Runtime leak detector for modern web apps — finds exposed API keys, BaaS misconfigurations (Supabase/Firebase RLS), and secrets in JS bundles, with a Chrome extension for real-time detection."
+authors = ["Amal David <amal@utopianlabs.co>"]
+maintainers = ["Amal David <amal@utopianlabs.co>"]
+license = "MIT"
+readme = "README.md"
+packages = [{include = "keyleak"}]
+keywords = ["security", "api-keys", "secrets", "supabase", "firebase", "baas", "vulnerability-scanner"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+
+[tool.poetry.urls]
+"Homepage" = "https://github.com/Amal-David/keyleak-detector"
+"Bug Tracker" = "https://github.com/Amal-David/keyleak-detector/issues"
+"Security" = "https://github.com/Amal-David/keyleak-detector/security/policy"
+
+[tool.poetry.dependencies]
+python = ">=3.12,<4.0"
+Flask = {version = "3.1.3", extras = ["async"]}
+requests = "2.34.2"
+certifi = "2026.10.19"
+beautifulsoup4 = "4.12.2"
+python-dotenv = "1.2.4"
+regex = "2023.10.3"
+playwright = "1.63.0"
+PyJWT = "2.15.1"
+tldextract = "5.1.2"
+PyYAML = "6.0.3"
+PySocks = "1.7.1"
+
+[tool.poetry.group.dev.dependencies]
+# Add dev dependencies here if needed
+
+[tool.poetry.scripts]
+keyleak = "keyleak.cli:main"
+
+[build-system]
+requires = ["poetry-core>=1.8.0"]
+build-backend = "poetry.core.masonry.api"
+
+# PEP 621 project table for uv / pip compatibility
+[project]
+name = "keyleak-detector"
+version = "0.7.0"
+description = "Runtime leak detector for modern web apps — finds exposed API keys, BaaS misconfigurations (Supabase/Firebase RLS), and secrets in JS bundles."
+requires-python = ">=3.12,<4.0"
+license = {text = "MIT"}
+authors = [{name = "Amal David", email = "amal@utopianlabs.co"}]
+maintainers = [{name = "Amal David", email = "amal@utopianlabs.co"}]
+readme = "README.md"
+keywords = ["security", "api-keys", "secrets", "supabase", "firebase", "baas", "vulnerability-scanner"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Security",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+]
+# PEP 621 runtime dependencies — mirrors [tool.poetry.dependencies] so that
+# `pip install .` / `uv pip install .` (which read this table, not poetry's)
+# ship a working package instead of zero deps (audit W8).
+dependencies = [
+    "Flask[async]==3.1.3",
+    "requests==2.34.2",
+    "certifi==2026.10.19",
+    "beautifulsoup4==4.12.2",
+    "python-dotenv==1.2.4",
+    "regex==2023.10.3",
+    "playwright==1.63.0",
+    "PyJWT==2.15.1",
+    "tldextract==5.1.2",
+    "PyYAML==6.0.3",
+    "PySocks==1.7.1",
+]
+
+[project.urls]
+Homepage = "https://github.com/Amal-David/keyleak-detector"
+Issues = "https://github.com/Amal-David/keyleak-detector/issues"
+Security = "https://github.com/Amal-David/keyleak-detector/security/policy"
+
+[project.scripts]
+keyleak = "keyleak.cli:main"

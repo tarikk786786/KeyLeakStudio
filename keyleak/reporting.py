@@ -1,0 +1,652 @@
+"""Report builders and output formatters."""
+
+from __future__ import annotations
+
+import html
+import json
+import shlex
+from typing import Any, Dict, Iterable, List, Optional
+
+from .attack_chains import correlate
+from .models import Finding, ScanReport, SEVERITY_ORDER, finding_from_legacy
+from .privacy_filter import scrub_snippet
+from .redaction import redact_url
+from . import __version__
+
+
+def _scrub_finding_pii(finding: Finding) -> Finding:
+    """Mask adjacent PII in a finding's evidence snippet, preserving the matched
+    (already-redacted) secret token.
+
+    Single chokepoint for the **Python report path**: every scan mode that builds
+    a report through ``build_report`` (local, CLI browser, site, BaaS) is scrubbed
+    here. Previously only ``local_scanner`` scrubbed, so CLI browser/BaaS/site
+    findings carried third-party emails/phones/cards into a report (audit W7).
+    Idempotent — re-scrubbing is a no-op — so local_scanner's earlier pass is
+    unaffected. The browser *extension* serializes findings client-side and
+    scrubs in its own ``extension/lib/reporting.js`` (parity, not this path).
+
+    Scope note: only ``evidence.snippet`` is scrubbed. ``source`` and
+    ``request_url`` are URLs already redacted via ``redact_url`` upstream; the
+    free-text ``risk_reason``/``remediation`` are tool-authored, not scanned
+    content, so they are not a PII vector. Snippet is the only field that carries
+    adjacent scanned content.
+    """
+    ev = finding.evidence
+    if ev is not None and ev.snippet:
+        ev.snippet = scrub_snippet(ev.snippet, ev.redacted_value or None)
+    return finding
+
+
+def build_report(
+    target: str,
+    findings: Iterable[Any],
+    scan_mode: str = "runtime",
+    attack_vectors: Optional[Dict[str, Any]] = None,
+    profile: str = "launch-gate",
+    packs: Optional[Iterable[str]] = None,
+    provenance: Optional[Dict[str, List[str]]] = None,
+    scan_options: Optional[Dict[str, Any]] = None,
+) -> ScanReport:
+    """Normalize findings and attach replay metadata without promoting static evidence to proof."""
+    normalized = normalize_findings(findings)
+    normalized.extend(_attack_vector_findings(attack_vectors or {}))
+    normalized.sort(key=lambda finding: SEVERITY_ORDER.get(finding.severity, 0), reverse=True)
+    selected_packs = list(packs or _packs_from_findings(normalized))
+
+    # Meta-analysis: correlate individual findings into chained attack vectors
+    # (e.g. published anon key + a table readable without RLS = unauthenticated
+    # data exfiltration). ``target`` anchors single-URL scans to one host;
+    # ``provenance`` (set by site_scanner) supplies host co-location for crawls.
+    chains = correlate(normalized, provenance=provenance, target=target)
+
+    extra: Dict[str, Any] = {
+        "profile": profile,
+        "packs": selected_packs,
+        "pack_summary": _pack_summary(normalized, selected_packs),
+    }
+    if chains:
+        extra["attack_chains"] = [vector.to_dict() for vector in chains]
+    if scan_options is not None:
+        extra["scan_manifest"] = {"schema_version": 1, "scanner_version": __version__, "options": scan_options,
+                                  "artifacts": [], "limitations": []}
+        if scan_options.get("scan_binaries"):
+            from .binary_scanner import binary_scan_limits
+            extra["scan_manifest"]["limits"] = binary_scan_limits()
+            extra["scan_manifest"]["limitations"] = ["Static extraction only; encrypted and runtime-constructed values can be missed."]
+
+    return ScanReport(
+        target=target,
+        scan_mode=scan_mode,
+        findings=normalized,
+        retest_command=_retest_command(target, scan_mode, scan_options),
+        extra=extra,
+    )
+
+
+def normalize_findings(findings: Iterable[Any]) -> List[Finding]:
+    normalized: List[Finding] = []
+    for raw in findings or []:
+        if isinstance(raw, Finding):
+            normalized.append(raw)
+        elif isinstance(raw, dict):
+            if "evidence" in raw or "risk_reason" in raw:
+                normalized.append(Finding.from_dict(raw))
+            else:
+                normalized.append(finding_from_legacy(raw))
+    # Single PII-scrub chokepoint: applies to every scan mode before any
+    # serializer sees the findings (audit W7).
+    for finding in normalized:
+        _scrub_finding_pii(finding)
+    return normalized
+
+
+def format_json(report: ScanReport) -> str:
+    return json.dumps(report.to_dict(), indent=2, sort_keys=True)
+
+
+def format_markdown(report: ScanReport) -> str:
+    """Render remediation and coverage alongside redacted findings and extraction locations."""
+    payload = report.to_dict()
+    lines = [
+        f"# KeyLeak Report: {payload['verdict']['label']}",
+        "",
+        f"- Target: `{payload['target']}`",
+        f"- Scan mode: `{payload['scan_mode']}`",
+        f"- Packs: `{', '.join(payload.get('packs') or []) or 'none'}`",
+        f"- Generated: `{payload['generated_at']}`",
+        f"- Reason: {payload['verdict']['reason']}",
+        f"- Re-test: `{payload['retest_command']}`",
+        "",
+    ]
+
+    lines.extend(_coverage_lines(payload))
+    chains = payload.get("attack_chains") or []
+    if chains:
+        lines.append("## Attack chains")
+        lines.append("")
+        lines.append(
+            "Individual findings correlated into exploitable paths "
+            "(this is what an attacker actually chains together):"
+        )
+        for chain in chains:
+            lines.extend(
+                [
+                    "",
+                    f"### {chain['severity'].upper()}: {chain['name']}",
+                    f"- Confidence: `{chain['confidence']}`",
+                    f"- Hosts: `{', '.join(chain.get('hosts') or []) or 'n/a'}`",
+                    f"- Chained from: {len(chain.get('member_finding_ids') or [])} finding(s)",
+                    f"- Path: {chain['narrative']}",
+                    f"- Fix: {chain['remediation']}",
+                ]
+            )
+        lines.append("")
+
+    lines.append("## Findings")
+
+    if not report.findings:
+        lines.append("No findings detected.")
+        return "\n".join(lines)
+
+    for finding in report.findings:
+        item = finding.to_dict()
+        lines.extend(
+            [
+                "",
+                f"### {item['severity'].upper()}: {item['type']}",
+                f"- ID: `{item['id']}`",
+                f"- Source: `{item['source']}`",
+                f"- Pack: `{item.get('category') or 'unknown'}`",
+                f"- Evidence: `{item['evidence']['redacted_value']}`",
+            ]
+        )
+        if item["evidence"].get("byte_offset") is not None:
+            lines.append(f"- Extraction: {_binary_location(item['evidence'])}")
+        remediation = _remediation_details(item)
+        if remediation["structured"]:
+            lines.extend(
+                [
+                    f"- What leaked: {remediation['what_leaked']}",
+                    f"- Why it matters: {remediation['why_it_matters']}",
+                    "- Fix steps:",
+                ]
+            )
+            for index, step in enumerate(remediation["fix_steps"], start=1):
+                lines.append(f"    {index}. {step}")
+            if remediation["verify_command"]:
+                lines.append(f"- Verify: `{remediation['verify_command']}`")
+        else:
+            lines.append(f"- Why it matters: {item['risk_reason']}")
+            lines.append(f"- Fix: {remediation['legacy']}")
+    return "\n".join(lines)
+
+
+def _remediation_details(item: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize structured remediation once for the report formatters."""
+    remediation_v2 = item.get("remediation_v2")
+    legacy = str(item.get("remediation") or "")
+    if not isinstance(remediation_v2, dict) or not remediation_v2:
+        return {"structured": False, "legacy": legacy}
+
+    fix_steps = remediation_v2.get("fix_steps")
+    if not isinstance(fix_steps, (list, tuple)):
+        return {"structured": False, "legacy": legacy}
+    return {
+        "structured": True,
+        "legacy": legacy,
+        "what_leaked": str(remediation_v2.get("what_leaked") or ""),
+        "why_it_matters": str(remediation_v2.get("why_it_matters") or item["risk_reason"]),
+        "fix_steps": [str(step) for step in fix_steps],
+        "verify_command": str(remediation_v2.get("verify_command") or ""),
+    }
+
+
+def _coverage_lines(payload: Dict[str, Any]) -> List[str]:
+    """Describe completed work, exclusions, and limits without treating an empty scope as proof."""
+    coverage = payload.get("coverage")
+    if not isinstance(coverage, dict):
+        return []
+    lines = [f"Coverage: {coverage.get('status', 'unknown')}; {coverage.get('completed', 0)}/{coverage.get('attempted', 0)} checks completed; "
+             f"{coverage.get('skipped', 0)} skipped, {coverage.get('failed', 0)} failed."]
+    inventory = payload.get("inventory")
+    if isinstance(inventory, dict):
+        lines.append(f"Inventory: {inventory.get('discovered', 0)} discovered files; {inventory.get('selected', 0)} selected; "
+                     f"{inventory.get('unsupported', 0)} unsupported; {inventory.get('excluded', 0)} excluded; "
+                     f"{inventory.get('excluded_directories', 0)} excluded directories.")
+    reasons = coverage.get("reasons", [])
+    if isinstance(reasons, list):
+        lines.extend(str(reason) for reason in reasons)
+    manifest = payload.get("scan_manifest")
+    if isinstance(manifest, dict) and isinstance(manifest.get("limitations", []), list):
+        lines.extend(str(reason) for reason in manifest.get("limitations", []))
+    return lines
+
+
+def _binary_location(evidence: Dict[str, Any]) -> str:
+    """Describe original byte spans separately from offsets within decoded text."""
+    text = f"Byte offset {evidence['byte_offset']}"
+    if evidence.get("byte_length") is not None:
+        text += f", length {evidence['byte_length']}"
+    extraction = evidence.get("extraction") or {}
+    if extraction:
+        text += f"; {extraction.get('encoding', 'unknown encoding')}"
+        transforms = [step["encoding"] for step in extraction.get("transforms", [])]
+        if transforms:
+            text += f"; decoded via {' -> '.join(transforms)} (decoded offset {extraction.get('decoded_offset', 0)})"
+    return text
+
+
+def format_html(report: ScanReport) -> str:
+    """Return a self-contained HTML vulnerability report."""
+    payload = report.to_dict()
+    verdict = payload["verdict"]
+    summary = payload["summary"]
+    packs = payload.get("packs") or []
+
+    e = html.escape  # shorthand
+
+    # --- verdict class & badge text ---
+    verdict_status = verdict["status"]
+    if verdict_status == "BLOCK_SHIP":
+        verdict_cls = "block"
+        verdict_badge = "Block Ship"
+    elif verdict_status == "REVIEW":
+        verdict_cls = "review"
+        verdict_badge = "Review"
+    else:
+        verdict_cls = "safe"
+        verdict_badge = "Safe to Ship" if verdict["label"] == "SAFE TO SHIP" else verdict["label"].capitalize()
+
+    # --- findings cards ---
+    finding_cards = []
+    for finding in report.findings:
+        item = finding.to_dict()
+        sev = e(item["severity"])
+        sev_lower = item["severity"].lower()
+        finding_type = e(item["type"])
+        risk = e(item["risk_reason"])
+        evidence_text = e(item["evidence"]["redacted_value"])
+        if item["evidence"].get("byte_offset") is not None:
+            evidence_text += "<br>" + e(_binary_location(item["evidence"]))
+        remediation = _remediation_details(item)
+        if remediation["structured"]:
+            remediation_html = (
+                f'<div>What leaked: {e(remediation["what_leaked"])}</div>'
+                f'<div>Why it matters: {e(remediation["why_it_matters"])}</div>'
+                '<div>Fix steps:</div>'
+                "<ol>" + "".join(f"<li>{e(step)}</li>" for step in remediation["fix_steps"]) + "</ol>"
+            )
+            if remediation["verify_command"]:
+                remediation_html += (
+                    f'<div>Verify: <code>{e(remediation["verify_command"])}</code></div>'
+                )
+        else:
+            remediation_html = f"Fix: <code>{e(remediation['legacy'])}</code>"
+        validation = item.get("validation_status", "")
+
+        validation_badge = ""
+        if validation == "confirmed":
+            validation_badge = '<span class="badge-confirmed">confirmed</span>'
+        elif validation == "validated":
+            validation_badge = '<span class="badge-validated">validated</span>'
+
+        card = f"""    <div class="finding {e(sev_lower)}">
+      <div class="finding-head">
+        <span class="sev {e(sev_lower)}">{sev.upper()}</span>
+        <span class="finding-type">{finding_type}</span>
+        {validation_badge}
+      </div>
+      <div class="finding-detail">{risk}</div>
+      <div class="finding-evidence">{evidence_text}</div>
+      <div class="finding-fix">{remediation_html}</div>
+    </div>"""
+        finding_cards.append(card)
+
+    findings_html = "\n\n".join(finding_cards) if finding_cards else "    <p>No findings detected.</p>"
+
+    # --- attack-chain cards (meta-analysis) ---
+    chain_cards = []
+    for chain in payload.get("attack_chains") or []:
+        c_sev = str(chain.get("severity") or "").lower()
+        c_conf = str(chain.get("confidence") or "")
+        # Don't paint a lead-confidence chain green/"confirmed" (honesty: a chain
+        # whose members are static leads is not an actively-confirmed attack).
+        conf_cls = "badge-confirmed" if c_conf == "confirmed" else "badge-lead"
+        chain_cards.append(
+            f"""    <div class="finding {e(c_sev)}">
+      <div class="finding-head">
+        <span class="sev {e(c_sev)}">{e(c_sev.upper())}</span>
+        <span class="finding-type">{e(str(chain.get('name') or ''))}</span>
+        <span class="{e(conf_cls)}">{e(c_conf)}</span>
+      </div>
+      <div class="finding-detail">{e(str(chain.get('narrative') or ''))}</div>
+      <div class="finding-fix">Fix: <code>{e(str(chain.get('remediation') or ''))}</code></div>
+    </div>"""
+        )
+    chains_section = ""
+    if chain_cards:
+        chains_section = (
+            '  <div class="section">\n'
+            '    <div class="section-title">Attack chains</div>\n\n'
+            + "\n\n".join(chain_cards)
+            + "\n  </div>\n\n"
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KeyLeak Vulnerability Report</title>
+<style>
+  :root {{
+    --bg: #0a0a0f;
+    --surface: #12121a;
+    --surface2: #1a1a26;
+    --border: #2a2a3a;
+    --text: #e0e0e8;
+    --text2: #8888a0;
+    --red: #ff4d6a;
+    --red-bg: rgba(255,77,106,.08);
+    --orange: #ff9f43;
+    --orange-bg: rgba(255,159,67,.08);
+    --yellow: #ffd43b;
+    --yellow-bg: rgba(255,212,59,.08);
+    --green: #51cf66;
+    --blue: #4dabf7;
+    --blue-bg: rgba(77,171,247,.06);
+    --mono: 'SF Mono', 'Cascadia Code', 'Fira Code', monospace;
+    --sans: -apple-system, BlinkMacSystemFont, 'Inter', 'Segoe UI', sans-serif;
+  }}
+  * {{ margin: 0; padding: 0; box-sizing: border-box; }}
+  body {{ background: var(--bg); color: var(--text); font-family: var(--sans); line-height: 1.5; padding: 40px 20px; }}
+  .wrap {{ max-width: 860px; margin: 0 auto; }}
+
+  /* Header */
+  .header {{ margin-bottom: 40px; }}
+  .header h1 {{ font-size: 15px; font-weight: 500; color: var(--text2); letter-spacing: .5px; text-transform: uppercase; margin-bottom: 8px; }}
+  .target {{ font-size: 22px; font-weight: 600; color: var(--text); font-family: var(--mono); margin-bottom: 16px; }}
+  .meta {{ display: flex; gap: 24px; font-size: 13px; color: var(--text2); flex-wrap: wrap; }}
+  .meta span {{ display: flex; align-items: center; gap: 6px; }}
+
+  /* Verdict banner */
+  .verdict {{ display: flex; align-items: center; gap: 16px; padding: 16px 20px; border-radius: 10px; margin-bottom: 32px; border: 1px solid; }}
+  .verdict.block {{ background: var(--red-bg); border-color: rgba(255,77,106,.2); }}
+  .verdict.review {{ background: var(--yellow-bg); border-color: rgba(255,212,59,.2); }}
+  .verdict.safe {{ background: rgba(81,207,102,.08); border-color: rgba(81,207,102,.2); }}
+  .verdict-badge {{ font-size: 11px; font-weight: 700; letter-spacing: 1px; text-transform: uppercase; padding: 4px 10px; border-radius: 4px; white-space: nowrap; }}
+  .verdict.block .verdict-badge {{ background: var(--red); color: #0a0a0f; }}
+  .verdict.review .verdict-badge {{ background: var(--yellow); color: #0a0a0f; }}
+  .verdict.safe .verdict-badge {{ background: var(--green); color: #0a0a0f; }}
+  .verdict-text {{ font-size: 14px; color: var(--text); }}
+
+  /* Stats row */
+  .stats {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 32px; }}
+  .stat {{ background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px; text-align: center; }}
+  .stat-num {{ font-size: 28px; font-weight: 700; font-family: var(--mono); }}
+  .stat-num.crit {{ color: var(--red); }}
+  .stat-num.high {{ color: var(--orange); }}
+  .stat-num.med {{ color: var(--yellow); }}
+  .stat-num.low {{ color: var(--blue); }}
+  .stat-label {{ font-size: 11px; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; margin-top: 4px; }}
+
+  /* Section */
+  .section {{ margin-bottom: 32px; }}
+  .section-title {{ font-size: 13px; font-weight: 600; color: var(--text2); text-transform: uppercase; letter-spacing: .5px; margin-bottom: 12px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }}
+
+  /* Finding card */
+  .finding {{ background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 16px 20px; margin-bottom: 10px; border-left: 3px solid transparent; }}
+  .finding.critical {{ border-left-color: var(--red); }}
+  .finding.high {{ border-left-color: var(--orange); }}
+  .finding.medium {{ border-left-color: var(--yellow); }}
+  .finding.low {{ border-left-color: var(--blue); }}
+  .finding-head {{ display: flex; align-items: center; gap: 10px; margin-bottom: 8px; }}
+  .sev {{ font-size: 10px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; padding: 2px 8px; border-radius: 3px; }}
+  .sev.critical {{ background: var(--red); color: #0a0a0f; }}
+  .sev.high {{ background: var(--orange); color: #0a0a0f; }}
+  .sev.medium {{ background: var(--yellow); color: #0a0a0f; }}
+  .sev.low {{ background: var(--blue); color: #0a0a0f; }}
+  .badge-confirmed {{ font-size: 10px; color: var(--green); border: 1px solid rgba(81,207,102,.3); padding: 1px 6px; border-radius: 3px; }}
+  .badge-validated {{ font-size: 10px; color: var(--blue); border: 1px solid rgba(77,171,247,.35); padding: 1px 6px; border-radius: 3px; }}
+  .badge-lead {{ font-size: 10px; color: var(--yellow); border: 1px solid rgba(255,212,59,.35); padding: 1px 6px; border-radius: 3px; }}
+  .finding-type {{ font-size: 14px; font-weight: 600; color: var(--text); }}
+  .finding-detail {{ font-size: 13px; color: var(--text2); margin-bottom: 6px; }}
+  .finding-evidence {{ font-family: var(--mono); font-size: 12px; background: var(--surface2); padding: 8px 12px; border-radius: 6px; color: var(--text); margin: 8px 0; overflow-x: auto; white-space: nowrap; }}
+  .finding-fix {{ font-size: 12px; color: var(--text2); margin-top: 8px; }}
+  .finding-fix code {{ font-family: var(--mono); font-size: 11px; background: var(--surface2); padding: 2px 6px; border-radius: 3px; color: var(--yellow); }}
+
+  /* Footer */
+  .footer {{ margin-top: 40px; padding-top: 20px; border-top: 1px solid var(--border); font-size: 12px; color: var(--text2); display: flex; justify-content: space-between; }}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="header">
+    <h1>KeyLeak Vulnerability Report</h1>
+    <div class="target">{e(payload["target"])}</div>
+    <div class="meta">
+      <span>Scan: {e(payload["scan_mode"])}</span>
+      <span>Packs: {e(", ".join(packs) or "none")}</span>
+      <span>{e(payload["generated_at"])}</span>
+    </div>
+  </div>
+
+  <div class="verdict {e(verdict_cls)}">
+    <span class="verdict-badge">{e(verdict_badge)}</span>
+    <span class="verdict-text">{e(verdict["reason"])}</span>
+  </div>
+
+  <div class="stats">
+    <div class="stat"><div class="stat-num crit">{summary["critical_severity"]}</div><div class="stat-label">Critical</div></div>
+    <div class="stat"><div class="stat-num high">{summary["high_severity"]}</div><div class="stat-label">High</div></div>
+    <div class="stat"><div class="stat-num med">{summary["medium_severity"]}</div><div class="stat-label">Medium</div></div>
+    <div class="stat"><div class="stat-num low">{summary["low_severity"]}</div><div class="stat-label">Low</div></div>
+  </div>
+
+  <div class="section">{''.join('<p>' + e(line) + '</p>' for line in _coverage_lines(payload))}</div>
+
+{chains_section}  <div class="section">
+    <div class="section-title">Findings</div>
+
+{findings_html}
+  </div>
+
+  <div class="footer">
+    <span>Generated by KeyLeak Detector</span>
+    <span>{e(payload["retest_command"])}</span>
+  </div>
+
+</div>
+</body>
+</html>"""
+
+
+def format_sarif(report: ScanReport) -> str:
+    """Export binary byte locations and run coverage without inventing source line positions."""
+    rules = {}
+    results = []
+
+    for finding in report.findings:
+        item = finding.to_dict()
+        detector_id = item["detector_id"]
+        remediation = _remediation_details(item)
+        sarif_remediation = (
+            {
+                "what_leaked": remediation["what_leaked"],
+                "why_it_matters": remediation["why_it_matters"],
+                "fix_steps": remediation["fix_steps"],
+                "verify_command": remediation["verify_command"],
+            }
+            if remediation["structured"]
+            else None
+        )
+        rules.setdefault(detector_id, {
+            "id": detector_id,
+            "name": item["type"],
+            "shortDescription": {"text": item["type"]},
+            "fullDescription": {"text": item["risk_reason"]},
+            "help": {"text": str(item["remediation"])},
+            "properties": {"category": item.get("category") or ""},
+        })
+        results.append(
+            {
+                "ruleId": detector_id,
+                "level": _sarif_level(item["severity"]),
+                "message": {"text": item["risk_reason"]},
+                "locations": [
+                    {
+                        "physicalLocation": {
+                            "artifactLocation": {"uri": item["source"]},
+                            "region": {
+                                **(
+                                    {"byteOffset": item["evidence"]["byte_offset"],
+                                     **({"byteLength": item["evidence"]["byte_length"]} if item["evidence"].get("byte_length") is not None else {})}
+                                    if item["evidence"].get("byte_offset") is not None
+                                    else {"startLine": item["evidence"].get("line") or 1}
+                                ),
+                            },
+                        }
+                    }
+                ],
+                "partialFingerprints": {
+                    "findingId": item["id"],
+                    **({"findingFingerprint": item["fingerprint"]} if item.get("fingerprint") else {}),
+                },
+                "properties": {
+                    "category": item.get("category") or "",
+                    **({"extraction": item["evidence"]["extraction"]} if item["evidence"].get("extraction") else {}),
+                    **({"remediation_v2": sarif_remediation} if sarif_remediation is not None else {}),
+                },
+            }
+        )
+
+    sarif = {
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [
+            {
+                "tool": {
+                    "driver": {
+                        "name": "KeyLeak Detector",
+                        "informationUri": "https://github.com/Amal-David/keyleak-detector",
+                        "rules": list(rules.values()),
+                    }
+                },
+                "results": results,
+                "properties": {key: report.extra[key] for key in ("coverage", "inventory", "scan_manifest") if key in report.extra},
+            }
+        ],
+    }
+    return json.dumps(sarif, indent=2, sort_keys=True)
+
+
+def report_to_text(report: ScanReport) -> str:
+    """Summarize coverage and up to ten findings while retaining the total finding count."""
+    payload = report.to_dict()
+    summary = payload["summary"]
+    lines = [
+        f"{payload['verdict']['label']}: {summary['critical_severity']} critical, "
+        f"{summary['high_severity']} high, {summary['medium_severity']} medium, "
+        f"{summary['low_severity']} low",
+        payload["verdict"]["reason"],
+        f"Re-test: {payload['retest_command']}",
+        f"Packs: {', '.join(payload.get('packs') or []) or 'none'}",
+    ]
+
+    lines.extend(_coverage_lines(payload))
+    for finding in payload["findings"][:10]:
+        lines.append(
+            f"- {finding['severity'].upper()} {finding['type']} at {finding['source']}: "
+            f"{finding['evidence']['redacted_value']}"
+        )
+        if finding["evidence"].get("byte_offset") is not None:
+            lines.append("  " + _binary_location(finding["evidence"]))
+    if len(payload["findings"]) > 10:
+        lines.append(f"... {len(payload['findings']) - 10} more findings")
+    return "\n".join(lines)
+
+
+def fail_threshold_met(report: ScanReport, threshold: str) -> bool:
+    threshold_rank = SEVERITY_ORDER.get(str(threshold).lower(), SEVERITY_ORDER["high"])
+    return any(SEVERITY_ORDER.get(finding.severity, 0) >= threshold_rank for finding in report.findings)
+
+
+def _attack_vector_findings(attack_vectors: Dict[str, Any]) -> List[Finding]:
+    converted: List[Finding] = []
+    for host_result in attack_vectors.get("subdomains", []) or []:
+        host = host_result.get("host") or host_result.get("url") or "attack-surface"
+        for finding in host_result.get("findings", []) or []:
+            raw = dict(finding)
+            raw.setdefault("source", f"Attack Surface: {host}")
+            raw.setdefault("url", host_result.get("url", ""))
+            raw.setdefault("category", "access-control")
+            raw.setdefault("validation_status", "lead")
+            converted.append(finding_from_legacy(raw, detector_prefix="attack-surface"))
+    return converted
+
+
+def _packs_from_findings(findings: Iterable[Finding]) -> List[str]:
+    packs = []
+    seen = set()
+    for finding in findings:
+        category = finding.category or "leak"
+        if category not in seen:
+            seen.add(category)
+            packs.append(category)
+    return packs
+
+
+def _pack_summary(findings: Iterable[Finding], selected_packs: Iterable[str]) -> Dict[str, Dict[str, int]]:
+    summary: Dict[str, Dict[str, int]] = {
+        pack: {
+            "total_findings": 0,
+            "critical_severity": 0,
+            "high_severity": 0,
+            "medium_severity": 0,
+            "low_severity": 0,
+            "info_severity": 0,
+        }
+        for pack in selected_packs
+    }
+    for finding in findings:
+        pack = finding.category or "leak"
+        if pack not in summary:
+            summary[pack] = {
+                "total_findings": 0,
+                "critical_severity": 0,
+                "high_severity": 0,
+                "medium_severity": 0,
+                "low_severity": 0,
+                "info_severity": 0,
+            }
+        summary[pack]["total_findings"] += 1
+        severity_key = f"{finding.severity}_severity"
+        summary[pack][severity_key] = summary[pack].get(severity_key, 0) + 1
+    return summary
+
+
+def _retest_command(target: str, scan_mode: str, scan_options: Optional[Dict[str, Any]] = None) -> str:
+    """Quote replay arguments and retain the effective local detector and extraction selection."""
+    safe_target = shlex.quote(redact_url(target))
+    if scan_mode == "local":
+        if scan_options is not None:
+            command = ["keyleak", "local", target, "--include", ",".join(scan_options["include"]),
+                       "--launch-profile", scan_options["launch_profile"], "--packs", ",".join(scan_options["packs"])]
+            command.extend("--" + name.replace("_", "-") for name in ("scan_node_modules", "scan_dist", "scan_binaries") if scan_options[name])
+            return shlex.join(command)
+        return f"keyleak local {safe_target}"
+    if scan_mode == "browser":
+        return f"keyleak browser-scan {safe_target}"
+    if scan_mode == "full-site":
+        return f"keyleak site-scan {safe_target}"
+    return f"keyleak scan {safe_target}"
+
+
+def _sarif_level(severity: str) -> str:
+    if severity in {"critical", "high"}:
+        return "error"
+    if severity == "medium":
+        return "warning"
+    return "note"

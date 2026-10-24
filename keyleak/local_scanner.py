@@ -1,0 +1,1001 @@
+"""Local file/config scanner for secrets and agent-era exposures."""
+
+from __future__ import annotations
+
+import math
+import hashlib
+import os
+import re
+import stat
+from pathlib import Path
+from typing import Iterable, List, Optional, Sequence, Tuple
+
+from .detectors import Detector, categories_for_packs, detectors_for_categories, normalize_packs
+from .detectors_ast import detect_worm_shape, is_worm_shape_target
+from .detectors_fuzzy import FingerprintHit, load_corpus, match_fingerprints
+from .detectors_splittoken import SplitTokenMatch, collect_fragments, find_split_tokens
+from .fingerprints import finding_fingerprint
+from .models import Evidence, Finding, build_coverage, confidence_for_severity
+from .privacy_filter import scrub_snippet as pii_scrub_snippet
+from .redaction import new_run_salt, redact_snippet, redact_url, redact_value
+from .reporting import build_report
+from .sourcemaps import (
+    reconstruct_originals,
+)
+
+
+# Lazy: cache the loaded fingerprint corpus across scans within one process.
+_FINGERPRINT_CORPUS_CACHE: Optional[List] = None
+
+
+def _get_fingerprint_corpus():
+    global _FINGERPRINT_CORPUS_CACHE
+    if _FINGERPRINT_CORPUS_CACHE is None:
+        try:
+            _FINGERPRINT_CORPUS_CACHE = load_corpus()
+        except ValueError:
+            _FINGERPRINT_CORPUS_CACHE = []
+    return _FINGERPRINT_CORPUS_CACHE
+
+
+DEFAULT_INCLUDES = ("env", "mcp", "ci", "docker", "sourcemaps", "logs")
+MAX_FILE_BYTES = 5 * 1024 * 1024
+MAX_OPT_IN_FILES = 1000
+MAX_OPT_IN_BYTES = 50 * 1024 * 1024
+MAX_OPT_IN_DIRECTORIES = 5000
+SKIP_DIRS = {
+    ".git",
+    ".hg",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    "__pycache__",
+    "dist",
+    "node_modules",
+    "venv",
+}
+SKIP_GENERATED_FILE_SUFFIXES = {
+    "extension/lib/detector-info.js",
+    "extension/lib/patterns.js",
+}
+
+
+def scan_path(
+    path: str,
+    includes: Sequence[str] = DEFAULT_INCLUDES,
+    profile: str = "launch-gate",
+    packs: Optional[Iterable[str]] = None,
+    *,
+    run_salt: Optional[bytes] = None,
+    scan_node_modules: bool = False,
+    scan_dist: bool = False,
+    scan_binaries: bool = False,
+    binary_source_prefix: Optional[str] = None,
+    _binary_budget: Optional[dict] = None,
+    _expanded_archives: Sequence[Path] = (),
+):
+    """Scan selected local files and retain replay options, byte identities, and coverage gaps."""
+    requested_target = Path(path).expanduser()
+    if requested_target.is_symlink():
+        raise ValueError("scan target must not be a symlink")
+    target = requested_target.resolve()
+    _expanded_archives = {path.resolve() for path in _expanded_archives}
+    findings: List[Finding] = []
+    active_packs = normalize_packs(packs, profile=profile)
+    active_includes = _effective_includes(includes, active_packs)
+    if run_salt is None:
+        run_salt = new_run_salt()
+
+    coverage_state = {"attempted": 0, "completed": 0, "skipped": 0, "failed": 0, "reasons": []}
+    inventory = {"discovered": 0, "selected": 0, "excluded": 0, "unsupported": 0, "containers": 0, "excluded_directories": 0}
+    artifacts = []
+    try:
+        root_mode = target.stat().st_mode
+    except OSError:
+        coverage_state["attempted"] = 1
+        _record_coverage(coverage_state, "failed", "scan root is missing or not a regular file or directory")
+        target_is_file = False
+    else:
+        target_is_file = stat.S_ISREG(root_mode)
+        if not target_is_file and not stat.S_ISDIR(root_mode):
+            coverage_state["attempted"] = 1
+            _record_coverage(coverage_state, "failed", "scan root is missing or not a regular file or directory")
+
+    scan_root = target.parent if target_is_file else target
+    code_files: List[Path] = []
+    binary_budget = _binary_budget if _binary_budget is not None else {"files": 0, "bytes": 0, "work_bytes": 0, "findings": 0}
+    for file_path, categories in _iter_candidate_files(
+        target, active_includes, scan_node_modules=scan_node_modules,
+        scan_dist=scan_dist, scan_binaries=scan_binaries,
+        coverage=coverage_state, target_is_file=target_is_file,
+        inventory=inventory,
+        expanded_archives=_expanded_archives,
+    ):
+        coverage_state["attempted"] += 1
+        relative = file_path.name if target_is_file else file_path.relative_to(target).as_posix()
+        source = f"{binary_source_prefix.rstrip('/!')}!/{relative}" if binary_source_prefix is not None else str(file_path)
+        artifact = {"source": source, "status": "not_scanned"}
+        artifacts.append(artifact)
+        if scan_binaries:
+            from .binary_scanner import (
+                BinaryScanLimitError,
+                is_binary_candidate,
+                scan_binary_file,
+            )
+            if is_binary_candidate(file_path):
+                try:
+                    binary_findings = scan_binary_file(
+                        file_path, detectors_for_categories(categories, active_packs),
+                        source=source, run_salt=run_salt,
+                        artifact_metadata=artifact, budget=binary_budget,
+                    )
+                    findings.extend(binary_findings)
+                    artifact["status"] = "scanned"
+                except BinaryScanLimitError as exc:
+                    artifact["status"] = "partial"
+                    findings.extend(exc.findings)
+                    _record_coverage(coverage_state, "skipped", str(exc))
+                    continue
+                except ValueError as exc:
+                    _record_coverage(coverage_state, "skipped", str(exc))
+                    continue
+                except OSError:
+                    _record_coverage(coverage_state, "failed", "binary file could not be read")
+                    continue
+                coverage_state["completed"] += 1
+                continue
+        findings.extend(
+            scan_file(
+                file_path, detectors_for_categories(categories, active_packs),
+                run_salt=run_salt, coverage=coverage_state, scan_root=scan_root,
+                source=source, artifact_metadata=artifact,
+            )
+        )
+        if file_path.suffix.lower() in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py"}:
+            code_files.append(file_path)
+
+    # Wave 3.4 — cross-file split-token reassembly. Opt-in via env var because
+    # the current algorithm is noisy on real-world corpora (any fragment that
+    # already starts with a key prefix produces N×M cross-file findings against
+    # every other-file fragment). The 313-repo dogfood scan surfaced this at
+    # 7M+ findings on cline/cline alone. Slated for redesign in v0.3 with a
+    # proper prefix-bridging gate; meanwhile, callers can opt in with
+    # ``KEYLEAK_ENABLE_SPLIT_TOKEN=1``.
+    if os.environ.get("KEYLEAK_ENABLE_SPLIT_TOKEN") == "1" and len(code_files) >= 2:
+        fragments_by_file = collect_fragments(code_files)
+        for match in find_split_tokens(fragments_by_file):
+            findings.append(_split_token_finding(match))
+
+    # Dependency lifecycle-hook audit (supply-chain). The regex pack skips
+    # node_modules, so a malicious dependency's preinstall/postinstall is
+    # otherwise invisible. Runs when the leak pack is active and a manifest is
+    # present. Read-only.
+    if "leak" in active_packs and target.is_dir():
+        # audit_node_dependencies walks for node_modules anywhere under target
+        # (incl. nested monorepo packages/*/node_modules) and no-ops if none.
+        from .lifecycle_audit import audit_node_dependencies
+        findings.extend(audit_node_dependencies(str(target)))
+
+    options = {"include": list(active_includes), "launch_profile": profile, "packs": list(active_packs),
+               "scan_node_modules": scan_node_modules, "scan_dist": scan_dist, "scan_binaries": scan_binaries}
+    report = build_report(str(target), findings, scan_mode="local", profile=profile, packs=active_packs,
+                          scan_options=options)
+    scopes = ["local files"]
+    if scan_node_modules:
+        scopes.append("node_modules sources")
+    if scan_dist:
+        scopes.append("root dist artifacts")
+    if scan_binaries:
+        scopes.append("binary strings")
+        if coverage_state["attempted"] == 0 and not _expanded_archives:
+            coverage_state["attempted"] = 1
+            _record_coverage(coverage_state, "skipped", "No eligible files in the requested binary scan scope")
+    report.extra["coverage"] = build_coverage(
+        ", ".join(scopes), **coverage_state,
+    )
+    report.extra["inventory"] = inventory
+    report.extra["scan_manifest"]["artifacts"] = artifacts
+    return report
+
+
+def _split_token_finding(match) -> Finding:
+    snippet = (
+        f"{match.fragment_a.file}:{match.fragment_a.line} + "
+        f"{match.fragment_b.file}:{match.fragment_b.line} = "
+        f"{match.prefix}..."
+    )
+    return Finding(
+        type="split_token_reassembly",
+        severity="critical",
+        confidence=0.75,
+        detector_id="leak.split_token_reassembly",
+        source=f"{match.fragment_a.file}+{match.fragment_b.file}",
+        evidence=Evidence(
+            source=match.fragment_a.file,
+            snippet=snippet[:600],
+            line=match.fragment_a.line,
+            redacted_value=f"{match.prefix}...[reassembled]",
+        ),
+        risk_reason=(
+            f"Two source files contain fragments that concatenate to a string starting with "
+            f"{match.prefix!r}. The bundle merges them at runtime; the regex pack sees only the "
+            "individual fragments."
+        ),
+        remediation=(
+            "Audit the call site. If the concatenation is intentional, restructure to fetch the "
+            "secret server-side. If unintentional, the splitting may be an evasion attempt."
+        ),
+        validation_status="lead",
+        category="leak",
+    )
+
+
+def scan_file(
+    file_path: Path,
+    detectors: Iterable[Detector],
+    *,
+    run_salt: Optional[bytes] = None,
+    coverage: Optional[dict] = None,
+    scan_root: Optional[Path] = None,
+    source: Optional[str] = None,
+    artifact_metadata: Optional[dict] = None,
+) -> List[Finding]:
+    """Scan bounded text and local source maps using stable logical provenance."""
+    try:
+        if file_path.stat().st_size > MAX_FILE_BYTES:
+            if coverage is not None:
+                _record_coverage(coverage, "skipped", "file exceeds per-file size limit")
+            return []
+        with file_path.open("rb") as input_file:
+            data = input_file.read(MAX_FILE_BYTES + 1)
+        if len(data) > MAX_FILE_BYTES:
+            if coverage is not None:
+                _record_coverage(coverage, "skipped", "file exceeds per-file size limit")
+            return []
+        content = data.decode("utf-8", errors="ignore")
+    except OSError:
+        if coverage is not None:
+            _record_coverage(coverage, "failed", "file could not be read")
+        return []
+
+    source = source or str(file_path)
+    if artifact_metadata is not None:
+        artifact_metadata.update(size_bytes=len(data), sha256=hashlib.sha256(data).hexdigest(), status="scanned")
+    detectors_list = list(detectors)
+    findings = scan_text(content, source, detectors_list, run_salt=run_salt)
+    # Missing source maps are coverage gaps even when the carrier is readable.
+    if file_path.suffix.lower() in {".js", ".mjs", ".cjs", ".html", ".htm"}:
+        def record_map_gap(reason: str) -> None:
+            if coverage is not None:
+                coverage["attempted"] += 1
+                _record_coverage(coverage, "skipped", reason)
+
+        originals = reconstruct_originals(
+            content, bundle_path=file_path, root=scan_root,
+            on_incomplete=record_map_gap if coverage is not None else None,
+        )
+        for entry in originals:
+            source_id = f"{source}#{entry.source_path}"
+            findings.extend(scan_text(entry.content, source_id, detectors_list, run_salt=run_salt))
+    # Wave 2.2 — capability-triad worm-shape scan on install scripts and
+    # node_modules sources. Independent of the regex pack; pure behavioral.
+    if is_worm_shape_target(file_path):
+        match = detect_worm_shape(content, source)
+        if match is not None:
+            findings.append(_worm_shape_finding(match, run_salt=run_salt))
+        # Wave 2.3 — fuzzy-hash fingerprint scan on the same targets.
+        corpus = _get_fingerprint_corpus()
+        if corpus:
+            for hit in match_fingerprints(content, corpus):
+                findings.append(_fingerprint_finding(source, hit))
+    if coverage is not None:
+        coverage["completed"] += 1
+    return findings
+
+
+def _worm_shape_finding(match, *, run_salt: Optional[bytes] = None) -> Finding:
+    summary = (
+        f"capability triad in {match.source}: "
+        f"env_read line {match.env_read_line}, "
+        f"net_egress line {match.net_egress_line}, "
+        f"persistence_write line {match.persistence_write_line}"
+    )
+    evidence = Evidence(
+        source=match.source,
+        snippet=match.excerpt_window[:600],
+        line=match.env_read_line,
+        redacted_value=summary[:200],
+    )
+    finding = Finding(
+        type="worm_shape_capability_triad",
+        severity="critical",
+        confidence=0.85,
+        detector_id="leak.worm_shape_capability_triad",
+        source=match.source,
+        evidence=evidence,
+        risk_reason=(
+            "A single source exhibits all three Mini Shai-Hulud capabilities: a credential-shaped "
+            "env-var read, network egress, and a write into a persistence-relevant directory. "
+            "This is the worm payload shape regardless of which strings or hostnames are used."
+        ),
+        remediation=(
+            "Remove the package or vendor the code in-tree. Rotate every credential the install "
+            "step could have read. Audit egress logs for the install timeframe."
+        ),
+        validation_status="lead",
+        category="leak",
+    )
+    return finding
+
+
+def _fingerprint_finding(source: str, hit: FingerprintHit) -> Finding:
+    snippet = (
+        f"matched worm fingerprint {hit.name!r} via {hit.matched} "
+        f"(score={hit.score:.2f}). References: {', '.join(hit.references) or 'n/a'}"
+    )
+    return Finding(
+        type="worm_fingerprint_match",
+        severity="critical",
+        confidence=hit.score if hit.matched == "fuzzy" else 0.95,
+        detector_id=f"leak.worm_fingerprint.{hit.name}",
+        source=source,
+        evidence=Evidence(
+            source=source,
+            snippet=snippet[:600],
+            redacted_value=snippet[:200],
+        ),
+        risk_reason=(
+            f"This file matches a known worm payload fingerprint ({hit.name}). "
+            f"{hit.description}"
+        ),
+        remediation=(
+            "Treat the host as compromised. Rotate every credential reachable from the affected "
+            "machine or CI runner: AWS, GCP, Kubernetes, Vault, GitHub, npm, SSH. Audit egress."
+        ),
+        validation_status="validated" if hit.matched == "exact" else "lead",
+        category="leak",
+        references=list(hit.references),
+    )
+
+
+def scan_text(
+    content: str,
+    source: str,
+    detectors: Iterable[Detector],
+    *,
+    run_salt: Optional[bytes] = None,
+    request_url: str = "",
+    byte_offset_base: Optional[int] = None,
+    byte_offset_width: int = 1,
+    max_findings: Optional[int] = None,
+    extraction: Optional[dict] = None,
+) -> List[Finding]:
+    """Apply detector gates and redact matches while mapping decoded evidence to its carrier."""
+    findings: List[Finding] = []
+    seen = set()
+    safe_request_url = redact_url(request_url) if request_url else ""
+    for detector in detectors:
+        if max_findings is not None and len(findings) >= max_findings:
+            break
+        regex = detector.compile()
+        line = 1
+        line_offset = 0
+        for match in regex.finditer(content):
+            if max_findings is not None and len(findings) >= max_findings:
+                break
+            raw_value = match.group(detector.capture_group) if detector.capture_group and match.groups() else match.group(1) if match.groups() else match.group(0)
+            token_start = (
+                match.start(detector.capture_group)
+                if detector.capture_group and match.groups()
+                else match.start(1) if match.groups() else match.start()
+            )
+            if _is_placeholder(raw_value, min_length=detector.min_match_length):
+                continue
+            # L.3 — database_url placeholder-password gate (skip dev defaults).
+            if detector.id == "database_url" and _is_placeholder_db_url(raw_value):
+                continue
+            # L.4 — Local-dev URL guard: skip findings whose hostname is loopback / .local / .test.
+            if _is_local_dev_url(raw_value):
+                continue
+            # Q.1 — Shannon-entropy filter: dictionary-word matches like
+            # `sk-indigo-twilight-color-1` (Skeleton UI class names) shouldn't
+            # trip credential detectors.
+            min_entropy = getattr(detector, "min_entropy", None)
+            if min_entropy is not None and _shannon_entropy(raw_value) < min_entropy:
+                continue
+            # Q.7 — basic-auth localhost guard: the L.4 generic check misses
+            # `https://localhost:'...@` substrings in minified JS where the
+            # "port" isn't a clean number. Check the user portion directly.
+            if detector.id == "http_basic_auth" and _is_basic_auth_localhost(raw_value):
+                continue
+            # Q.11 — extend the template-string guard to http_basic_auth.
+            # Workflow YAML / install scripts often contain
+            # ``http://${USER}:${PASSWORD}@host`` shapes that are interpolated
+            # at runtime, not actual creds.
+            if detector.id == "http_basic_auth" and any(m in str(raw_value) for m in _TEMPLATE_MARKERS):
+                continue
+            # Q.8 — bearer/secret tokens that literally start with a "public"
+            # prefix are by definition public.
+            if detector.id in {"bearer_token", "openai_api_key", "stripe_secret_key"} and _has_public_prefix(raw_value):
+                continue
+            line += content.count("\n", line_offset, match.start())
+            line_offset = match.start()
+            snippet = _snippet_for(content, match.start(), match.end())
+            # Q.6 + Q.9 — AIza referrer-restricted keys: Google's Firebase /
+            # Maps / Analytics keys are designed to live in client code.
+            # Downgrade severity if ANY client-side marker (firebaseConfig,
+            # gapi, googleapis Maps, gtag, fbq) appears in the *same file* —
+            # not just the ±80-char snippet (markers usually live elsewhere
+            # in the file).
+            effective_severity = detector.severity
+            if detector.id == "gemini_api_key" and _looks_like_client_side_aiza(content):
+                effective_severity = "medium"
+            redacted_value = redact_value(raw_value, run_salt=run_salt)
+            byte_offset = (
+                byte_offset_base + token_start * byte_offset_width
+                if byte_offset_base is not None
+                else None
+            )
+            decoded = bool(extraction and extraction.get("transforms"))
+            extraction_evidence = dict(extraction) if extraction is not None else None
+            if decoded:
+                byte_offset = byte_offset_base
+                extraction_evidence["decoded_offset"] = token_start
+            key = (detector.canonical_id, source, redacted_value, line, byte_offset, token_start if decoded else None)
+            if key in seen:
+                continue
+            seen.add(key)
+            if byte_offset_base is None:
+                redacted_snippet = redact_snippet(snippet, raw_value, run_salt=run_salt)
+                redacted_snippet = pii_scrub_snippet(redacted_snippet, redacted_value)
+            else:
+                redacted_snippet = ""
+            evidence = Evidence(
+                source=source,
+                snippet=redacted_snippet,
+                line=line,
+                request_url=safe_request_url,
+                redacted_value=redacted_value,
+                byte_offset=byte_offset,
+                byte_length=(extraction["encoded_length"] if decoded else len(raw_value) * byte_offset_width) if byte_offset is not None else None,
+                extraction=extraction_evidence,
+            )
+            findings.append(
+                Finding(
+                    type=detector.result_type,
+                    severity=effective_severity,
+                    confidence=confidence_for_severity(effective_severity, source),
+                    detector_id=detector.canonical_id,
+                    source=source,
+                    evidence=evidence,
+                    risk_reason=detector.description,
+                    remediation=detector.remediation,
+                    validation_status=detector.validation_status,
+                    category=detector.pack,
+                    references=list(detector.references),
+                    fingerprint=finding_fingerprint(
+                        detector_id=detector.canonical_id,
+                        source=source,
+                        raw_value=raw_value,
+                        request_url=safe_request_url,
+                        line=line,
+                        byte_offset=byte_offset,
+                        decoded_offset=token_start if decoded else None,
+                    ),
+                    remediation_v2=detector.get_remediation().to_dict(),
+                )
+            )
+    return findings
+
+
+def _iter_candidate_files(
+    target: Path,
+    includes: Sequence[str],
+    *,
+    scan_node_modules: bool = False,
+    scan_dist: bool = False,
+    coverage: Optional[dict] = None,
+    target_is_file: bool = False,
+    scan_binaries: bool = False,
+    inventory: dict,
+    expanded_archives: Sequence[Path] = (),
+):
+    """Yield policy-selected files, distinguishing unsupported inputs from explicit exclusions."""
+    if target_is_file:
+        inventory["discovered"] += 1
+        categories = _categories_for_file(target, includes)
+        if categories or (scan_binaries and _binary_candidate(target)):
+            inventory["selected"] += 1
+            yield target, categories
+        elif scan_binaries and coverage is not None:
+            coverage["attempted"] += 1
+            _record_coverage(coverage, "skipped", "Unsupported file in requested binary scan scope")
+            inventory["unsupported"] += 1
+        else:
+            inventory["excluded"] += 1
+        return
+
+    budgets = {
+        "node_modules": {"files": 0, "bytes": 0},
+        "dist": {"files": 0, "bytes": 0},
+    }
+    capped = set()
+    traversed_dirs = {"node_modules": 0, "dist": 0}
+
+    def walk_error(_error):
+        if coverage is not None:
+            coverage["attempted"] += 1
+            _record_coverage(coverage, "failed", "directory could not be read")
+
+    for root, dirs, files in os.walk(target, followlinks=False, onerror=walk_error):
+        root_path = Path(root)
+        in_node_modules = "node_modules" in root_path.relative_to(target).parts
+        in_root_dist = root_path == target / "dist" or (target / "dist") in root_path.parents
+        active_scope = "node_modules" if in_node_modules else "dist" if in_root_dist else None
+        if active_scope:
+            if active_scope in capped:
+                dirs[:] = []
+                continue
+            traversed_dirs[active_scope] += 1
+            if traversed_dirs[active_scope] > MAX_OPT_IN_DIRECTORIES and active_scope not in capped:
+                capped.add(active_scope)
+                dirs[:] = []
+                if coverage is not None:
+                    coverage["attempted"] += 1
+                    _record_coverage(coverage, "skipped", f"bounded {active_scope} directory limit reached")
+                continue
+        kept_dirs = []
+        for directory in dirs:
+            directory_path = root_path / directory
+            rel_parts = directory_path.relative_to(target).parts
+            is_root_dist = len(rel_parts) == 1 and directory == "dist"
+            selected_scope = (
+                (directory == "node_modules" and (scan_node_modules or scan_binaries))
+                or (is_root_dist and (scan_dist or scan_binaries))
+                or (in_node_modules and directory == "dist")
+            )
+            if directory in SKIP_DIRS and not selected_scope:
+                inventory["excluded_directories"] += 1
+                continue
+            if directory_path.is_symlink():
+                if coverage is not None:
+                    coverage["attempted"] += 1
+                    _record_coverage(coverage, "skipped", "directory symlink was not traversed")
+                continue
+            kept_dirs.append(directory)
+        dirs[:] = sorted(kept_dirs)
+        for filename in sorted(files):
+            file_path = root_path / filename
+            inventory["discovered"] += 1
+            if file_path in expanded_archives:
+                inventory["containers"] += 1
+                continue
+            before_attempted = coverage["attempted"] if coverage is not None else 0
+            candidate = _candidate_for_local_scan(
+                file_path, target, includes, scan_node_modules, scan_dist,
+                budgets, capped, coverage,
+                scan_binaries,
+            )
+            if candidate is not None:
+                inventory["selected"] += 1
+                yield candidate
+            elif (scan_binaries and coverage is not None and coverage["attempted"] == before_attempted
+                  and not _is_generated_file(file_path)
+                  and not (in_node_modules and not scan_node_modules)
+                  and not (in_root_dist and not scan_dist)):
+                coverage["attempted"] += 1
+                _record_coverage(coverage, "skipped", "Unsupported file in requested binary scan scope")
+                inventory["unsupported"] += 1
+            else:
+                inventory["excluded"] += 1
+
+
+def _candidate_for_local_scan(
+    file_path: Path,
+    target: Path,
+    includes: Sequence[str],
+    scan_node_modules: bool,
+    scan_dist: bool,
+    budgets: dict,
+    capped: set,
+    coverage: Optional[dict],
+    scan_binaries: bool = False,
+) -> Optional[Tuple[Path, List[str]]]:
+    rel_parts = file_path.relative_to(target).parts
+    in_node_modules = "node_modules" in rel_parts
+    in_root_dist = (target / "dist") in file_path.parents
+    suffix = file_path.suffix.lower()
+    if file_path.is_symlink():
+        if coverage is not None:
+            coverage["attempted"] += 1
+            _record_coverage(coverage, "skipped", "file symlink was not scanned")
+        return None
+    binary_candidate = scan_binaries and _binary_candidate(file_path)
+    if in_node_modules and not (
+        (scan_node_modules and suffix in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"})
+        or binary_candidate
+    ):
+        return None
+    if in_root_dist and not (
+        (scan_dist and suffix in {".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".map"})
+        or binary_candidate
+    ):
+        return None
+    if _is_generated_file(file_path):
+        return None
+    try:
+        resolved_file = file_path.resolve(strict=True)
+        resolved_file.relative_to(target)
+    except (OSError, ValueError):
+        if coverage is not None:
+            coverage["attempted"] += 1
+            _record_coverage(coverage, "skipped", "file symlink escaped scan root or could not be resolved")
+        return None
+    scope = "node_modules" if in_node_modules else "dist" if in_root_dist else None
+    if scope:
+        if scope in capped:
+            return None
+        budget = budgets[scope]
+        try:
+            size = resolved_file.stat().st_size
+        except OSError:
+            size = MAX_FILE_BYTES + 1
+        if budget["files"] >= MAX_OPT_IN_FILES or budget["bytes"] + size > MAX_OPT_IN_BYTES:
+            capped.add(scope)
+            if coverage is not None:
+                coverage["attempted"] += 1
+                _record_coverage(coverage, "skipped", f"bounded {scope} file or byte limit reached")
+            return None
+        budget["files"] += 1
+        budget["bytes"] += size
+    categories = [] if in_node_modules else _categories_for_file(file_path, includes)
+    if categories or in_node_modules:
+        return file_path, categories
+    if binary_candidate:
+        return file_path, []
+    return None
+
+
+def _binary_candidate(path: Path) -> bool:
+    from .binary_scanner import is_binary_candidate
+
+    return is_binary_candidate(path)
+
+
+def _record_coverage(coverage: dict, field: str, reason: str) -> None:
+    coverage[field] += 1
+    if len(coverage["reasons"]) < 20:
+        coverage["reasons"].append(reason)
+
+
+def _is_generated_file(path: Path) -> bool:
+    normalized = str(path).replace(os.sep, "/")
+    return any(normalized.endswith(suffix) for suffix in SKIP_GENERATED_FILE_SUFFIXES)
+
+
+def _matches_include(path: Path, includes: Sequence[str]) -> bool:
+    return bool(_categories_for_file(path, includes))
+
+
+def _categories_for_file(path: Path, includes: Sequence[str]) -> List[str]:
+    requested = {include.lower() for include in includes}
+    name = path.name.lower()
+    full = str(path).lower()
+    suffix = path.suffix.lower()
+
+    checks = {
+        "env": name.startswith(".env") or name.endswith(".env") or name in {"config.json", "secrets.json"},
+        "mcp": "mcp" in name or name in {"claude_desktop_config.json", "codex.json"} or ".cursor" in full,
+        "ci": ".github/workflows" in full or name in {".gitlab-ci.yml", "circle.yml", "buildkite.yml"},
+        "docker": name in {"dockerfile", "compose.yml", "docker-compose.yml"} or name.endswith(".dockerfile"),
+        "sourcemaps": name.endswith((".map", ".js", ".html", ".htm")),
+        "logs": name.endswith(".log") or name.endswith(".txt"),
+        "code": suffix in {
+            ".py", ".js", ".jsx", ".ts", ".tsx", ".java", ".go", ".rb", ".php", ".cs",
+            ".rs", ".swift", ".kt", ".sql", ".graphql", ".html", ".htm",
+        },
+        "tests": (
+            "/test" in full
+            or "/tests" in full
+            or ".spec." in name
+            or ".test." in name
+            or name.startswith("test_")
+            or name.endswith("_test.py")
+        ),
+        "docs": "/docs/" in full or suffix in {".md", ".rst", ".adoc"},
+        "config": suffix in {".json", ".yml", ".yaml", ".toml", ".ini", ".cfg"} or name in {"package.json", "pyproject.toml"},
+    }
+
+    return [include for include in requested if checks.get(include, False)]
+
+
+def _effective_includes(includes: Sequence[str], packs: Tuple[str, ...]) -> Tuple[str, ...]:
+    requested = {include.lower() for include in includes}
+    requested.update(categories_for_packs(packs))
+    return tuple(sorted(requested))
+
+
+def _snippet_for(content: str, start: int, end: int, radius: int = 80) -> str:
+    snippet_start = max(0, start - radius)
+    snippet_end = min(len(content), end + radius)
+    snippet = content[snippet_start:snippet_end].replace("\n", " ")
+    if snippet_start > 0:
+        snippet = "..." + snippet
+    if snippet_end < len(content):
+        snippet = snippet + "..."
+    return snippet
+
+
+# L.3 — placeholder passwords that show up in `postgres://postgres:postgres@...`
+# style dev defaults. The 313-repo dogfood produced 323 critical database_url
+# findings, the vast majority of them in this dev-default shape. Q.3 expanded
+# this with project-name dev defaults the live-URL dogfood surfaced.
+_PLACEHOLDER_DB_PASSWORDS = {
+    "postgres", "postgresql", "root", "password", "pass", "passwd",
+    "hunter2", "changeme", "change-me", "dev", "test", "testing",
+    "admin", "default", "secret", "example", "placeholder",
+    # Q.3 — additional project-name dev defaults seen in the live dogfood.
+    "posthog", "prisma", "hatchet", "convex", "supabase", "redis",
+    "mysql", "mongodb", "mongo", "rabbitmq", "kafka", "minio",
+    "elastic", "elasticsearch", "clickhouse", "temporal", "appuser",
+    "app", "user", "service", "ci", "ci-user", "ci_user",
+}
+
+# Q.3 — password suffix patterns that are also placeholders.
+_PLACEHOLDER_DB_PASSWORD_SUFFIXES = (
+    "_password", "_pass", "_pwd", "_secret", "_credential",
+    "-password", "-pass", "-pwd", "-secret",
+)
+
+# Q.2 — template / format-string markers in the password component.
+# These never appear in a real credential; they always indicate
+# interpolation-at-runtime. Q.13 extended with capitalized-braced names.
+_TEMPLATE_MARKERS = ("${", "$(", "%s", "%d", "{0}", "{1}", "{{", "<value>", "<your_", "<replace", "{value}")
+_BRACED_PLACEHOLDER_RE = re.compile(r"\{[A-Z_][A-Z_0-9]*\}")
+
+# L.3 — database_url regex: postgres://user:pass@host:port/db
+_DB_URL_RE = re.compile(
+    r"^(?P<scheme>postgres(?:ql)?|mysql2?|mongodb(?:\+srv)?|redis)://"
+    r"(?P<user>[^:@/\s]+):"
+    r"(?P<password>[^@/\s]+)@"
+    r"(?P<host>[^:/?\s]+)",
+    re.IGNORECASE,
+)
+
+
+def _is_placeholder_db_url(value: object) -> bool:
+    text = str(value or "").strip()
+    match = _DB_URL_RE.search(text)
+    if not match:
+        return False
+    user = (match.group("user") or "").strip().lower()
+    password = (match.group("password") or "").strip()
+    password_lower = password.lower()
+    # Q.2 — template/format-string interpolation marker → never a real cred.
+    if any(marker in password for marker in _TEMPLATE_MARKERS):
+        return True
+    if any(marker in user for marker in _TEMPLATE_MARKERS):
+        return True
+    # Q.13 — capitalized braced placeholders like ``{POSTGRES_PASSWORD}``.
+    if _BRACED_PLACEHOLDER_RE.search(password) or _BRACED_PLACEHOLDER_RE.search(match.group("user") or ""):
+        return True
+    # Q.13 — ALL-CAPS user/password like ``USER``, ``PASSWORD``, ``HOST``.
+    raw_user = match.group("user") or ""
+    raw_pass = match.group("password") or ""
+    if raw_user.isupper() and raw_user.replace("_", "").isalpha():
+        return True
+    if raw_pass.isupper() and raw_pass.replace("_", "").isalpha():
+        return True
+    # L.3 — known placeholder password literal.
+    if password_lower in _PLACEHOLDER_DB_PASSWORDS:
+        return True
+    # Q.3 — placeholder password suffixes (`*_password`, `*_pass`, etc.).
+    if any(password_lower.endswith(s) for s in _PLACEHOLDER_DB_PASSWORD_SUFFIXES):
+        return True
+    # Q.4 — user == password is a near-universal dev default
+    # (`postgres:postgres@db`, `posthog:posthog@db`, `prisma:prisma@db`).
+    if user and user == password_lower:
+        return True
+    return False
+
+
+# L.4 — Local-dev URL host guard. Any matched value whose host portion is
+# loopback / .local / .test / .lan is almost certainly a dev/test artifact.
+# Applies to any detector that captures a URL-shaped value.
+_LOCAL_DEV_HOST_RE = re.compile(
+    r"://"
+    r"(?:[^@/\s]+@)?"
+    r"(?P<host>"
+    r"localhost|"
+    r"127\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+    r"::1|"
+    r"\[?::1\]?|"
+    r"0\.0\.0\.0|"
+    r"host\.docker\.internal|"
+    r"[A-Za-z0-9-]+\.(?:local|test|localhost|lan|invalid)"
+    r")"
+    r"(?::\d+)?"
+    r"(?:[/?#]|$)",
+    re.IGNORECASE,
+)
+
+
+def _is_local_dev_url(value: object) -> bool:
+    text = str(value or "")
+    if "://" not in text:
+        return False
+    return bool(_LOCAL_DEV_HOST_RE.search(text))
+
+
+# Q.7 — basic-auth-specific localhost guard. The L.4 generic regex requires a
+# clean port + path tail, which the minified-JS substrings on workos /
+# materialize / glean don't have (e.g., `https://localhost:'...@`). Check the
+# user portion of the matched ``http://USER:PASS@`` block directly.
+_BASIC_AUTH_USER_RE = re.compile(
+    r"https?://(?P<user>[^:@/\s]+):",
+    re.IGNORECASE,
+)
+_BASIC_AUTH_LOCAL_USERS = {
+    "localhost", "127.0.0.1", "0.0.0.0", "::1",
+    "host.docker.internal",
+}
+
+
+def _is_basic_auth_localhost(value: object) -> bool:
+    """Check whether the captured value (either the bare user portion captured
+    by the basic-auth regex, or the full ``http://...@`` URL) refers to a
+    loopback / local-dev host."""
+
+    text = str(value or "").strip().lower()
+    # Case 1: scanner passed in the captured-user group directly.
+    if text in _BASIC_AUTH_LOCAL_USERS:
+        return True
+    if text.endswith((".local", ".test", ".localhost", ".lan", ".invalid")):
+        return True
+    # Case 2: scanner passed in the full ``http://USER:PASS@`` block.
+    match = _BASIC_AUTH_USER_RE.search(text)
+    if match:
+        user = (match.group("user") or "").strip().lower()
+        if user in _BASIC_AUTH_LOCAL_USERS:
+            return True
+        if user.endswith((".local", ".test", ".localhost", ".lan", ".invalid")):
+            return True
+    return False
+
+
+# Q.8 — values that announce themselves as public (``public_key_*``, ``pk_*``,
+# ``publishable_*``, ``client_id_*``) shouldn't trip critical secret detectors.
+_PUBLIC_PREFIXES = ("public_", "public-", "publishable_", "publishable-", "pk_", "client_id_", "client-id-")
+
+
+def _has_public_prefix(value: object) -> bool:
+    text = str(value or "").strip().lower()
+    # The basic_auth / bearer / openai regex may capture a "Bearer foo" or
+    # "Authorization: Bearer foo" lead-in; strip it before checking.
+    for prefix in ("bearer ", "authorization: bearer ", "bearer:"):
+        if text.startswith(prefix):
+            text = text[len(prefix):].lstrip()
+            break
+    return any(text.startswith(p) for p in _PUBLIC_PREFIXES)
+
+
+# Q.6 — Google's AIza-prefixed keys are often referrer-restricted client keys
+# (Firebase, Maps, Analytics, Custom Search). Surface a softer "medium"
+# severity when the surrounding snippet has any of these markers. We don't
+# fully suppress because un-restricted server keys *do* leak this way too.
+_CLIENT_SIDE_AIZA_MARKERS = (
+    "firebaseConfig",
+    "firebase_config",
+    "apiKey",
+    "api_key",
+    "google_api_key",
+    "googleapikey",
+    "gapi.client",
+    "maps.googleapis.com",
+    "googleapis.com/maps",
+    "google-analytics.com",
+    "googletagmanager.com",
+    "googletagservices",
+    "firebaseapp",
+    "appsforyourdomain",
+    "youtube.googleapis.com",
+    "GoogleAnalyticsObject",
+    "ga(",
+    "gtag(",
+    "fbq(",
+    # Q.12 — OAuth + GIS markers (Google Identity Services).
+    "apps.googleusercontent.com",
+    "google_client_id",
+    "google_project_id",
+    "drive_import",
+    "google_drive",
+    "googledrive",
+    "google.accounts.id",
+    "accounts.google.com",
+    "GIS_CLIENT_ID",
+)
+
+
+def _looks_like_client_side_aiza(snippet: object) -> bool:
+    text = str(snippet or "")
+    return any(marker.lower() in text.lower() for marker in _CLIENT_SIDE_AIZA_MARKERS)
+
+
+def _shannon_entropy(value: object) -> float:
+    """Shannon entropy in bits/character.
+
+    Dictionary-word matches like ``sk-indigo-twilight-color-1`` have entropy
+    around 3.0 bits/char. Real OpenAI / AWS / Stripe keys are ~5.0+ bits/char
+    (random alphanumeric). Threshold of 4.0 separates them cleanly.
+    """
+
+    text = str(value or "")
+    if not text:
+        return 0.0
+    counts: dict = {}
+    for ch in text:
+        counts[ch] = counts.get(ch, 0) + 1
+
+    total = len(text)
+    return -sum((c / total) * math.log2(c / total) for c in counts.values())
+
+
+def _is_placeholder(value: object, min_length: int = 8) -> bool:
+    raw = str(value or "")
+    text = raw.strip().lower()
+    if min_length > 0 and len(text) < min_length:
+        return True
+    exact = {"example", "placeholder", "changeme", "dummy", "fake", "test"}
+    if text in exact:
+        return True
+    prefixes = (
+        "your_",
+        "your-",
+        "example_",
+        "example-",
+        "placeholder_",
+        "placeholder-",
+        "changeme_",
+        "changeme-",
+        "dummy_",
+        "dummy-",
+        "fake_",
+        "fake-",
+        "test_",
+        "test-",
+        "xxxx",
+        "abcd1234",
+    )
+    if text.startswith(prefixes):
+        return True
+    tokens = {token for token in re.split(r"[^a-z0-9]+", text) if token}
+    if tokens and tokens.issubset(exact):
+        return True
+    # Q.13 — well-known placeholder words appearing as a substring of the
+    # captured value (``AKIAIOSFODNN7EXAMPLE``, ``ABCDPLACEHOLDER123``, etc.).
+    for word in ("example", "placeholder", "changeme", "dummy", "fake"):
+        if word in text and len(text) - len(word) < 20:
+            return True
+    # Q.13 — high single-character repetition is a docs / example placeholder.
+    # ``AKIAXXXXXXXXXXXXXXXX``, ``AAAAAAAAAAAAAAAAAAAAA``, etc.
+    alnum = re.sub(r"[^a-z0-9]", "", text)
+    if alnum and len(alnum) >= 8:
+        counts: dict = {}
+        for ch in alnum:
+            counts[ch] = counts.get(ch, 0) + 1
+        most_common_share = max(counts.values()) / len(alnum)
+        if most_common_share >= 0.5:
+            return True
+    # Q.13 — ALL-CAPS-LETTER-ONLY placeholders like ``USER``, ``PASSWORD``,
+    # ``POSTGRES_PASSWORD``. Real credentials almost always include digits;
+    # require letters-and-underscores only to keep AWS-shaped keys (which are
+    # uppercase letters + digits) from being false-positive-suppressed.
+    if raw and re.fullmatch(r"[A-Z][A-Z_]*", raw) and "_" in raw or raw in {
+        "USER", "USERNAME", "PASSWORD", "PASS", "HOST", "PORT", "DATABASE",
+        "DBNAME", "DB", "SECRET", "TOKEN", "API_KEY", "APIKEY",
+    }:
+        return True
+    # Q.13 — capitalized braced placeholder like ``{POSTGRES_PASSWORD}``.
+    if re.fullmatch(r"\{[A-Z_][A-Z_0-9]*\}", raw):
+        return True
+    return False
